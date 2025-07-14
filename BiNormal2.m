@@ -1,105 +1,116 @@
-classdef BiNormal2
+% File: Normal.m
+classdef BiNormal2 < handle
+    %NORMAL   Bivariate normal with censoring and likelihood calculation
+
     properties
-        data
-        ndata
-        NVAR = 2
-        coef0
-        rho
-        stdX
-        stdY
-        covMat
-        meanVec
-        stdRatio
-        stdXGivenY
-        cutoffIntercept
-        cutoffSlopeInverse
-        lowerLimY
-        upperLimY
-        invCovMat
+        data                 % ndata×2 array of [logX, logY]
+        ndata                % number of observations
+        NVAR                 % number of variables (2)
+        coef0                % constant term in log‐MVN pdf
+
+        rho                  % correlation coefficient
+        stdX                 % standard deviation of X
+        stdY                 % standard deviation of Y
+        covMat               % 2×2 covariance matrix
+        meanVec              % 1×2 mean vector [meanX, meanY]
+        stdRatio             % stdX/stdY
+        stdXGivenY           % conditional std of X given Y
+        cutoffIntercept      % intercept of censoring line
+        cutoffSlopeInverse   % 1/slope of censoring line
+        lowerLimY            % integration lower limit for Y
+        upperLimY            % integration upper limit for Y
     end
-    
+
     methods
         function obj = BiNormal2(logX, logY)
-            if length(logX) ~= length(logY)
-                error("Error: dataset lengths not equivalent");
+            % Constructor: check lengths, store data, precompute coef0.
+            if numel(logX) ~= numel(logY)
+                error('Error: dataset lengths not equivalent');
             end
-            
-            obj.data = double([logX(:), logY(:)]);
-            obj.ndata = length(logX);
-            obj.coef0 = obj.NVAR * log(1 / sqrt(2 * pi));
+            obj.data   = double([logX(:), logY(:)]);
+            obj.ndata  = size(obj.data,1);
+            obj.NVAR   = 2;
+            obj.coef0  = obj.NVAR * log(1/sqrt(2*pi));
         end
-        
-        function val = integrateXGivenY(obj, yval)
-            avgXGivenY = obj.meanVec(1) + obj.stdRatio * obj.rho * (yval - obj.meanVec(2));
-            threshX = (yval - obj.cutoffIntercept) * obj.cutoffSlopeInverse;
-            val = normpdf(yval, obj.meanVec(2), obj.stdY) * normcdf(threshX, avgXGivenY, obj.stdXGivenY);
+
+        function val = integrateXGivenY(obj, y)
+            % Integrand: f_Y(y) * P[X > threshold | Y=y]
+            avgXGivenY = obj.meanVec(1) ...
+                       + obj.stdRatio * obj.rho * (y - obj.meanVec(2));
+            threshX    = (y - obj.cutoffIntercept) * obj.cutoffSlopeInverse;
+            val = normpdf(y, obj.meanVec(2), obj.stdY) ...
+                .* normcdf(threshX, avgXGivenY, obj.stdXGivenY);
         end
-        
-        function normFac = getNormFac(obj)
-            normFac = integral(@(y) obj.integrateXGivenY(y), obj.lowerLimY, obj.upperLimY, 'AbsTol', 1e-4);
+
+        function normFac = getNormFac(obj, vecValued)
+            % Normalization factor via numerical integration
+            if nargin < 2
+                vecValued = false;
+            end
+            opts = {'AbsTol',1e-4};
+            if vecValued
+                opts = [opts, {'ArrayValued',true}];
+            end
+            normFac = integral( @(y) obj.integrateXGivenY(y), ...
+                                 obj.lowerLimY, obj.upperLimY, opts{:} );
         end
-        
+
         function logLike = getLogLike_fast(obj, param)
-            obj.rho = tanh(param(5));
-            obj.meanVec = param(1:2);
-            obj.stdX = exp(param(3));
-            obj.stdY = exp(param(4));
-            obj.cutoffSlopeInverse = 1 / param(6);
-            obj.cutoffIntercept = param(7);
+            % Compute log‐likelihood for given parameter vector
+            % param = [meanX, meanY, logStdX, logStdY, fisherRho, slope, intercept]
 
-            obj.covMat = [obj.stdX^2, obj.rho * obj.stdX * obj.stdY;
-                  obj.rho * obj.stdX * obj.stdY, obj.stdY^2];
+            % Ensure param is a 1×7 row vector
+            param = reshape(param, 1, []);
 
-            obj.stdXGivenY = sqrt(obj.stdX^2 * (1 - obj.rho^2));
-            obj.stdRatio = obj.stdX / obj.stdY;
-            %obj.cutoffSlopeInverse = 1 / param(6);
-            %obj.cutoffIntercept = param(7);
+            % Unpack and compute basic stats
+            obj.rho     = tanh( param(5) );
+            obj.meanVec = double( param(1:2) );
+            obj.stdX    = exp( param(3) );
+            obj.stdY    = exp( param(4) );
 
-            significance = 4 * obj.stdY;
-            obj.lowerLimY = obj.meanVec(2) - significance;
-            obj.upperLimY = obj.meanVec(2) + significance;
+            % Build covariance matrix
+            obj.covMat = [ obj.stdX^2,                obj.rho*obj.stdX*obj.stdY;
+                           obj.rho*obj.stdX*obj.stdY, obj.stdY^2             ];
 
-            disp(size(obj.data));
-            disp(size(obj.meanVec));
-            disp(size(obj.covMat));
+            % Conditional and scaling terms
+            obj.stdXGivenY         = sqrt( obj.covMat(1,1) * (1 - obj.rho^2) );
+            obj.stdRatio           = obj.stdX / obj.stdY;
+            obj.cutoffSlopeInverse = 1/param(6);
+            obj.cutoffIntercept    = param(7);
 
+            % Integration limits for Y (±3σ)
+            dY = 3 * obj.stdY;
+            obj.lowerLimY = obj.meanVec(2) - dY;
+            obj.upperLimY = obj.meanVec(2) + dY;
+
+            % Check covariance positive‐definite
             if det(obj.covMat) == 0
-                error("Covariance matrix not positive-definite.");
+                error('Covariance matrix not positive‐definite.');
             end
 
-            obj.invCovMat = inv(obj.covMat);
+            invCovMat = inv(obj.covMat);
+            coef = obj.coef0 + log( sqrt(det(invCovMat)) );
 
-            disp(size(obj.invCovMat));
-
-            coef = -0.5*obj.NVAR * log(2*pi) - 0.5*log(det(obj.invCovMat));
-
-            disp(size(coef));
-
-            % Vectorized condition check
-            invalidIdx = obj.data(:,2) < (param(6) * obj.data(:,1) + param(7));
-            if any(invalidIdx)
+            % Censoring‐line check
+            X = obj.data(:,1);
+            Y = obj.data(:,2);
+            slope     = param(6);
+            intercept = param(7);
+            if any( Y < slope*X + intercept )
                 logLike = -1e100;
-                return;
+                return
             end
 
-            % Vectorized quadratic term computation
-            normedPoints = obj.data - obj.meanVec;
+            % Mahalanobis‐like term
+            diffs = bsxfun(@minus, obj.data, obj.meanVec);   % ndata×2
+            quad  = sum( (diffs * invCovMat) .* diffs, 2 );  % ndata×1
 
-            disp(size(normedPoints));
+            % Normalizing constant (scalar)
+            normFac = obj.getNormFac(false);
 
-            quadraticTerms = sum(normedPoints * obj.invCovMat * normedPoints');
-
-            disp(size(quadraticTerms));
-
-            logLike = sum(coef - 0.5 * quadraticTerms);
-
-            disp(size(logLike));
-
-            % Approximate normalization factor
-            yvals = linspace(obj.lowerLimY, obj.upperLimY, 100);
-            normFac = sum(arrayfun(@obj.integrateXGivenY, yvals)) * (obj.upperLimY - obj.lowerLimY) / 100;
-
-            logLike = logLike - obj.ndata * log(normFac);
+            % Final log‐likelihood
+            logLike = obj.ndata * (coef - log(normFac)) ...
+                      - 0.5 * sum(quad);
         end
     end
 end
